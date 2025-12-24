@@ -15,13 +15,15 @@ from src.ocr_engine import OCREngine
 from src.path_encoder import PathEncoder
 from src.segmenter import Segmenter
 from src.es_client import ESClient
+from src.text_cleaner import TextCleaner
 
 
 class PDFProcessor:
     """PDF 处理主类"""
     
-    def __init__(self, no_es: bool = False):
+    def __init__(self, no_es: bool = False, enable_clean: bool = False):
         self.no_es = no_es
+        self.enable_clean = enable_clean
         self.ocr_engine = OCREngine()
         self.segmenter = Segmenter(
             min_length=MIN_SEGMENT_LENGTH,
@@ -429,9 +431,53 @@ class PDFProcessor:
             else:
                 print("   --no-es: 已跳过 Elasticsearch 索引，结果已保存为 JSON 文件")
         
-        # 5. 验证
-        print(f"\n5. 验证与统计")
+        # 5. 文本清洗与聚合（可选）
+        if self.enable_clean and all_documents:
+            print(f"\n5. 执行文本清洗与聚合...")
+            self._run_text_cleaning()
+        
+        # 6. 验证
+        step_num = 6 if self.enable_clean else 5
+        print(f"\n{step_num}. 验证与统计")
         self._validate_and_report()
+    
+    def _run_text_cleaning(self):
+        """对当前任务的所有PDF输出执行文本清洗"""
+        if not self.task_dir:
+            print("  错误: 任务目录未设置")
+            return
+        
+        # 查找所有PDF输出子目录
+        pdf_dirs = [d for d in self.task_dir.iterdir() if d.is_dir() and (d / 'pages').exists()]
+        
+        if not pdf_dirs:
+            print("  未找到可清洗的PDF输出目录")
+            return
+        
+        print(f"  找到 {len(pdf_dirs)} 个PDF输出目录")
+        
+        for pdf_dir in pdf_dirs:
+            print(f"\n  清洗文档: {pdf_dir.name}")
+            output_file = pdf_dir / 'cleaned_chunks.json'
+            log_file = pdf_dir / 'cleaner.log'
+            
+            cleaner = TextCleaner(
+                confidence_threshold=0.1,
+                short_line_threshold=20,
+                height_ratio_threshold=1.3,
+                min_gap_threshold=15.0,
+                log_file=log_file
+            )
+            
+            try:
+                stats = cleaner.clean_document(pdf_dir, output_file)
+                print(f"    - 生成 {stats.get('total_chunks', 0)} 个chunks")
+                print(f"    - 输出: {output_file.name}")
+                print(f"    - 日志: {log_file.name}")
+            except Exception as e:
+                print(f"    清洗失败: {e}")
+                import traceback
+                traceback.print_exc()
     
     def _validate_and_report(self):
         """验证索引并生成报告"""
@@ -479,15 +525,165 @@ class PDFProcessor:
                     print(f"测试查询时出错: {e}")
         else:
             print("\n已跳过 Elasticsearch 测试查询（--no-es 模式或未配置 ESClient）。")
+        
+        # 执行清洗步骤（如果启用）
+        if self.enable_clean:
+            from src.text_cleaner import SectionAggregator
+            from datetime import datetime
+            
+            print("\n" + "="*60)
+            print("开始文本清洗与聚合...")
+            print("="*60)
+            
+            # 查找所有PDF输出目录
+            pdf_dirs = [d for d in self.task_dir.iterdir() if d.is_dir() and (d / 'pages').exists()]
+            aggregator = SectionAggregator(log_callback=print)
+            
+            for pdf_dir in pdf_dirs:
+                print(f"\n清洗: {pdf_dir.name}")
+                
+                output_file = pdf_dir / 'cleaned_chunks.json'
+                log_file = pdf_dir / 'cleaner.log'
+                sections_file = pdf_dir / 'cleaned_basic_part.json'
+                
+                cleaner = TextCleaner(
+                    confidence_threshold=0.1,
+                    short_line_threshold=20,
+                    height_ratio_threshold=1.3,
+                    min_gap_threshold=15.0,
+                    log_file=log_file
+                )
+                
+                try:
+                    # 一级清洗
+                    stats = cleaner.clean_document(pdf_dir, output_file)
+                    print(f"  ✓ 生成 {stats.get('total_chunks', 0)} 个chunks")
+                    
+                    # 二级聚合
+                    with open(output_file, 'r', encoding='utf-8') as f:
+                        chunks_data = json.load(f)
+                    
+                    sections = aggregator.aggregate_sections(chunks_data['chunks'])
+                    
+                    sections_data = {
+                        'doc_name': pdf_dir.name,
+                        'cleaned_at': datetime.now().isoformat(),
+                        'stats': {
+                            'total_sections': len(sections),
+                            'total_chunks': len(chunks_data['chunks']),
+                            'avg_chunks_per_section': len(chunks_data['chunks']) / len(sections) if sections else 0
+                        },
+                        'sections': sections
+                    }
+                    
+                    with open(sections_file, 'w', encoding='utf-8') as f:
+                        json.dump(sections_data, f, ensure_ascii=False, indent=2)
+                    
+                    print(f"  ✓ 生成 {len(sections)} 个sections")
+                    
+                except Exception as e:
+                    print(f"  ✗ 清洗失败: {e}")
+                    import traceback
+                    traceback.print_exc()
+            
+            print("\n文本清洗与聚合完成!")
 
 
 def main():
     """主函数"""
     parser = argparse.ArgumentParser(description="PDF OCR -> ES pipeline")
     parser.add_argument('--no-es', action='store_true', help='Only run OCR and segmentation and save JSON; skip ES indexing')
+    parser.add_argument('--clean', action='store_true', help='Enable text cleaning and aggregation after OCR')
+    parser.add_argument('--clean-only', type=str, metavar='DIR', help='Run cleaning only on existing output directory (e.g., output/run_20251224_120521)')
     args = parser.parse_args()
 
-    processor = PDFProcessor(no_es=args.no_es)
+    # 离线清洗模式
+    if args.clean_only:
+        from src.text_cleaner import SectionAggregator
+        from datetime import datetime
+        
+        clean_only_dir = Path(args.clean_only)
+        if not clean_only_dir.exists():
+            print(f"错误: 目录不存在: {clean_only_dir}")
+            sys.exit(1)
+        
+        print("=" * 60)
+        print("离线清洗模式")
+        print("=" * 60)
+        
+        # 判断是任务目录还是PDF目录
+        if (clean_only_dir / 'pages').exists():
+            # 单个PDF目录
+            pdf_dirs = [clean_only_dir]
+        else:
+            # 任务目录，查找所有PDF子目录
+            pdf_dirs = [d for d in clean_only_dir.iterdir() if d.is_dir() and (d / 'pages').exists()]
+        
+        if not pdf_dirs:
+            print(f"未找到包含 pages/ 的PDF输出目录: {clean_only_dir}")
+            sys.exit(1)
+        
+        print(f"找到 {len(pdf_dirs)} 个PDF输出目录")
+        
+        aggregator = SectionAggregator(log_callback=print)
+        
+        for pdf_dir in pdf_dirs:
+            print(f"\n{'='*60}")
+            print(f"清洗: {pdf_dir.name}")
+            print("="*60)
+            
+            output_file = pdf_dir / 'cleaned_chunks.json'
+            log_file = pdf_dir / 'cleaner.log'
+            sections_file = pdf_dir / 'cleaned_basic_part.json'
+            
+            cleaner = TextCleaner(
+                confidence_threshold=0.1,
+                short_line_threshold=20,
+                height_ratio_threshold=1.3,
+                min_gap_threshold=15.0,
+                log_file=log_file
+            )
+            
+            try:
+                # 一级清洗：生成chunks
+                stats = cleaner.clean_document(pdf_dir, output_file)
+                print(f"\n✓ 生成 {stats.get('total_chunks', 0)} 个chunks")
+                
+                # 二级聚合：生成sections
+                with open(output_file, 'r', encoding='utf-8') as f:
+                    chunks_data = json.load(f)
+                
+                sections = aggregator.aggregate_sections(chunks_data['chunks'])
+                
+                sections_data = {
+                    'doc_name': pdf_dir.name,
+                    'cleaned_at': datetime.now().isoformat(),
+                    'stats': {
+                        'total_sections': len(sections),
+                        'total_chunks': len(chunks_data['chunks']),
+                        'avg_chunks_per_section': len(chunks_data['chunks']) / len(sections) if sections else 0
+                    },
+                    'sections': sections
+                }
+                
+                with open(sections_file, 'w', encoding='utf-8') as f:
+                    json.dump(sections_data, f, ensure_ascii=False, indent=2)
+                
+                print(f"✓ 生成 {len(sections)} 个sections")
+                print(f"✓ 输出: {sections_file.name}")
+                
+            except Exception as e:
+                print(f"✗ 清洗失败: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        print("\n" + "=" * 60)
+        print("离线清洗完成!")
+        print("=" * 60)
+        return
+
+    # 正常流程
+    processor = PDFProcessor(no_es=args.no_es, enable_clean=args.clean)
     processor.run()
     
     print("\n" + "=" * 60)
