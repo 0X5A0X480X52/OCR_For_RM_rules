@@ -72,11 +72,11 @@
 ### 1. 完整流程（OCR + 清洗 + 索引）
 
 ```bash
-# 执行OCR、清洗并索引到ES
-python main.py --clean
+# 执行OCR、清洗并索引到ES（默认启用清洗并索引）
+python main.py
 
 # 仅OCR和清洗，不索引（离线处理）
-python main.py --clean --no-es
+python main.py --no-es
 ```
 
 ### 2. 离线清洗模式
@@ -205,7 +205,7 @@ output/
 ## 注意事项
 
 1. 原始OCR数据（旧的documents结构）不再索引到ES
-2. 必须先执行 `--clean` 生成清洗数据才能索引
+2. 清洗在主流程中默认启用；如需单独清洗请使用 `--clean-only`，如需禁用清洗请使用 `--no-clean`。
 3. ES索引名称变更：
    - 旧: `robomaster_docs`
    - 新: `robomaster_docs_chunks`, `robomaster_docs_sections`

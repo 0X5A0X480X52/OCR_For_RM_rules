@@ -194,11 +194,14 @@ curl http://localhost:9200
 ### 常用命令（CLI）
 
 ```powershell
-# 完整流程：OCR -> 清洗 -> 索引
-python main.py --clean
+# 完整流程（默认启用清洗并索引）: OCR -> 清洗 -> 索引
+python main.py
 
-# 完整流程但不索引（离线清洗）
-python main.py --clean --no-es
+# 完整流程但不索引（仅本地输出清洗结果）
+python main.py --no-es
+
+# 若想禁用清洗（仅 OCR -> 保存原始 _processed.json），使用 --no-clean
+python main.py --no-clean
 
 # 仅对已有输出目录进行清洗
 python main.py --clean-only output/run_YYYYMMDD_HHMMSS

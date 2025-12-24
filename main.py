@@ -423,7 +423,7 @@ class PDFProcessor:
         # 4. 批量索引到 ES（原始数据，已废弃）
         print(f"\n4. 处理完成，保存原始结果")
         print(f"   总节点数: {len(all_documents)}")
-        print("   注意：原始数据不再索引到ES，请使用 --clean 生成清洗数据")
+        print("   注意：原始数据不再索引到ES。默认会对生成的输出执行清洗并将清洗结果索引到 ES；如需禁用清洗，请使用 --no-clean")
         
         # 5. 文本清洗与聚合（可选）
         if self.enable_clean and all_documents:
@@ -694,7 +694,11 @@ def main():
     """主函数"""
     parser = argparse.ArgumentParser(description="PDF OCR -> ES pipeline")
     parser.add_argument('--no-es', action='store_true', help='Only run OCR and segmentation and save JSON; skip ES indexing')
-    parser.add_argument('--clean', action='store_true', help='Enable text cleaning and aggregation after OCR')
+    # 清洗默认启用，提供 --no-clean 用于禁用
+    clean_group = parser.add_mutually_exclusive_group()
+    clean_group.add_argument('--clean', dest='clean', action='store_true', help='Enable text cleaning and aggregation after OCR (default)')
+    clean_group.add_argument('--no-clean', dest='clean', action='store_false', help='Disable text cleaning and aggregation')
+    parser.set_defaults(clean=True)
     parser.add_argument('--clean-only', type=str, metavar='DIR', help='Run cleaning only on existing output directory (e.g., output/run_20251224_120521)')
     parser.add_argument('--index-only', type=str, metavar='DIR', help='Index cleaned data from existing output directory to ES')
     args = parser.parse_args()
@@ -984,7 +988,7 @@ def main():
         print("=" * 60)
         return
 
-    # 正常流程
+    # 正常流程（默认启用清洗并索引清洗结果）
     processor = PDFProcessor(no_es=args.no_es, enable_clean=args.clean)
     processor.run()
     
