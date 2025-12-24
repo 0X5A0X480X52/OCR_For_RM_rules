@@ -48,9 +48,33 @@ if ($LASTEXITCODE -ne 0) {
     exit 1
 }
 
-# 5. Install Python dependencies
+# 5. Setup Python virtual environment
 Write-Host ""
-Write-Host "5. Installing Python dependencies..." -ForegroundColor Green
+Write-Host "5. Setting up Python virtual environment..." -ForegroundColor Green
+if (Test-Path ".venv") {
+    Write-Host "   ✓ Virtual environment already exists" -ForegroundColor White
+} else {
+    Write-Host "   Creating virtual environment..." -ForegroundColor Yellow
+    python -m venv .venv
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "   ✗ Failed to create virtual environment" -ForegroundColor Red
+        exit 1
+    }
+    Write-Host "   ✓ Virtual environment created" -ForegroundColor White
+}
+
+# Activate virtual environment
+Write-Host "   Activating virtual environment..." -ForegroundColor Yellow
+& .\.venv\Scripts\Activate.ps1
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "   ✗ Failed to activate virtual environment" -ForegroundColor Red
+    exit 1
+}
+Write-Host "   ✓ Virtual environment activated" -ForegroundColor White
+
+# 6. Install Python dependencies
+Write-Host ""
+Write-Host "6. Installing Python dependencies..." -ForegroundColor Green
 Write-Host "   (this may take a few minutes)" -ForegroundColor Yellow
 pip install -r requirements.txt
 
@@ -61,9 +85,9 @@ if ($LASTEXITCODE -ne 0) {
 
 Write-Host "   ✓ Dependencies installed" -ForegroundColor White
 
-# 6. Run main program
+# 7. Run main program
 Write-Host ""
-Write-Host "6. Running the processing pipeline..." -ForegroundColor Green
+Write-Host "7. Running the processing pipeline..." -ForegroundColor Green
 Write-Host ""
 
 python main.py

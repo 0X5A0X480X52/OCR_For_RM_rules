@@ -21,9 +21,30 @@ cd docker\elasticsearch-ik
 docker run -d --name es-ik -p 9200:9200 -e "discovery.type=single-node" -e "xpack.security.enabled=false" -v "C:\esdata:/usr/share/elasticsearch/data" local/elasticsearch-ik:8.10.2
 ```
 
-### 2. 安装 Python 依赖
+### 2. 安装 Python 依赖（推荐使用虚拟环境）
+
+项目包含自动引导脚本 `run.ps1`，会在运行前检查并创建 `.venv`，激活后安装依赖并运行完整流程（推荐）：
 
 ```powershell
+# 推荐：一键引导（会创建/激活 .venv，安装依赖并运行）
+.\run.ps1
+```
+
+如果希望手动控制虚拟环境和依赖安装，请按下面步骤操作：
+
+```powershell
+# 在 PowerShell 中创建并激活虚拟环境
+python -m venv .venv
+& .\.venv\Scripts\Activate.ps1
+
+# 安装依赖
+pip install -r requirements.txt
+```
+
+仓库中还提供 `setup_venv.ps1` 用于仅创建/激活虚拟环境：
+
+```powershell
+.\setup_venv.ps1
 pip install -r requirements.txt
 ```
 
@@ -44,6 +65,15 @@ cp .env.example .env
 ## 使用方法
 
 ### 运行完整流程
+
+推荐使用 `.\run.ps1` 来执行完整流程（包含 ES 启动、虚拟环境的检查/创建、依赖安装和主程序运行）：
+
+```powershell
+# 推荐：一键运行（Windows PowerShell）
+.\run.ps1
+```
+
+或者在已激活虚拟环境中单独执行：
 
 ```powershell
 python main.py
@@ -151,6 +181,87 @@ curl http://localhost:9200
 - 检查依赖是否完整安装
 - 调整 `OCR_CONFIDENCE_THRESHOLD`
 - 查看 `processing_report.json` 中的错误信息
+
+## 索引与清洗（Chunks / Sections） 🔧
+
+从清洗后的数据我们采用**双层索引**策略：
+
+- **Chunks（细粒度）**: `robomaster_docs_chunks` - 每个 chunk 是语义连续、主题一致的文本块，适合精确定位具体段落。
+- **Sections（粗粒度）**: `robomaster_docs_sections` - 按标题/章节聚合的内容，便于理解完整语境。
+
+索引会保留完整的来源信息（`doc_name`/`doc_id`、`source_pages`、`page_range`、`bbox_range`、`confidence_avg` 等），并支持高亮检索。
+
+### 常用命令（CLI）
+
+```powershell
+# 完整流程：OCR -> 清洗 -> 索引
+python main.py --clean
+
+# 完整流程但不索引（离线清洗）
+python main.py --clean --no-es
+
+# 仅对已有输出目录进行清洗
+python main.py --clean-only output/run_YYYYMMDD_HHMMSS
+
+# 仅对已有清洗结果进行索引（离线索引）
+python main.py --index-only output/run_YYYYMMDD_HHMMSS
+```
+
+> 提示：`run.ps1` 提供一键引导（包含虚拟环境、依赖安装、ES 启动和完整流程），推荐在 Windows 上直接使用。
+
+## 输出文件与目录结构 📁
+
+运行后会在 `output/` 下生成按时间的 `run_YYYYMMDD_HHMMSS/` 任务目录，单个文档目录内典型文件：
+
+- `pages/page_###.json`, `pages/page_###.txt`：每页的原始 PyMuPDF/OCR 审计文件
+- `*_processed.json`：主流程生成的原始节点列表（已废弃为ES索引来源，保留审计）
+- `cleaned_chunks.json`：一级清洗（chunk）输出，可直接索引到 chunks 索引
+- `cleaned_basic_part.json`：二级聚合（section）输出，可直接索引到 sections 索引
+- `cleaner.log`：清洗审计日志
+- `processing_report.json`：任务统计报告
+
+## 清洗模块（TextCleaner）参数（默认值）
+
+清洗器核心参数可在 `src/text_cleaner.py` 或在 `main.py` 中调用时传入：
+
+- `confidence_threshold=0.1`：OCR 置信度阈值，低于丢弃
+- `short_line_threshold=20`：短行长度阈值（标题判定）
+- `height_ratio_threshold=1.3`：字号/高度突变倍数用于标题判断
+- `min_gap_threshold=15.0`：段间距阈值（像素），用于强断开
+
+这些规则实现了“先贪婪合并、再用强信号切断”的策略，使得生成的 chunk 更加语义友好、检索友好。
+
+## 配置（`config.py`）与常用环境变量 ⚙️
+
+主要配置:
+
+- `ES_HOST`（默认 `http://localhost:9200`）
+- `ES_INDEX_NAME`（默认 `robomaster_docs`，最终索引为 `{ES_INDEX_NAME}_chunks` 和 `{ES_INDEX_NAME}_sections`）
+- `ES_BULK_SIZE`（批量写入大小，默认 `1000`）
+- `OCR_CONFIDENCE_THRESHOLD`（OCR 阈值，默认 `0.6`）
+- `USE_GPU`（是否使用 GPU：`true/false`）
+- `MIN_SEGMENT_LENGTH`, `MAX_SEGMENT_LENGTH`（分段长度上下限，默认 `15` / `500`）
+
+可以通过 `.env` 或环境变量覆盖上述配置。
+
+## ES 兼容性与测试 ✅
+
+- 推荐 Elasticsearch 服务器版本：**8.10.2**（项目中使用并测试通过）
+- 推荐 Python 客户端版本：**elasticsearch==8.10.0**（以匹配服务器）
+
+常用测试脚本：
+
+```powershell
+# ES 连接与索引测试
+python test_es_connection.py
+python test_es_search.py
+```
+
+已知控制台输出中可能遇到 GBK 编码错误 (Windows 环境)，可以用：
+
+```powershell
+$env:PYTHONIOENCODING = "utf-8"
+```
 
 ## License
 

@@ -420,24 +420,22 @@ class PDFProcessor:
                     "error": str(e)
                 })
         
-        # 4. 批量索引到 ES
-        print(f"\n4. 处理完成，保存或索引结果")
+        # 4. 批量索引到 ES（原始数据，已废弃）
+        print(f"\n4. 处理完成，保存原始结果")
         print(f"   总节点数: {len(all_documents)}")
-
-        if all_documents:
-            if not self.no_es:
-                result = self.es_client.bulk_index(all_documents)
-                print(f"   已索引到 ES - 成功: {result['success']} 失败: {result['error']}")
-            else:
-                print("   --no-es: 已跳过 Elasticsearch 索引，结果已保存为 JSON 文件")
+        print("   注意：原始数据不再索引到ES，请使用 --clean 生成清洗数据")
         
         # 5. 文本清洗与聚合（可选）
         if self.enable_clean and all_documents:
             print(f"\n5. 执行文本清洗与聚合...")
             self._run_text_cleaning()
+            
+            # 6. 索引清洗后的数据到ES
+            print(f"\n6. 索引清洗后的数据到 Elasticsearch...")
+            self._index_cleaned_data_to_es()
         
-        # 6. 验证
-        step_num = 6 if self.enable_clean else 5
+        # 7. 验证
+        step_num = 7 if self.enable_clean else 5
         print(f"\n{step_num}. 验证与统计")
         self._validate_and_report()
     
@@ -456,10 +454,15 @@ class PDFProcessor:
         
         print(f"  找到 {len(pdf_dirs)} 个PDF输出目录")
         
+        from src.text_cleaner import SectionAggregator
+        from datetime import datetime
+        aggregator = SectionAggregator(log_callback=print)
+        
         for pdf_dir in pdf_dirs:
             print(f"\n  清洗文档: {pdf_dir.name}")
             output_file = pdf_dir / 'cleaned_chunks.json'
             log_file = pdf_dir / 'cleaner.log'
+            sections_file = pdf_dir / 'cleaned_basic_part.json'
             
             cleaner = TextCleaner(
                 confidence_threshold=0.1,
@@ -470,14 +473,101 @@ class PDFProcessor:
             )
             
             try:
+                # 一级清洗：生成chunks
                 stats = cleaner.clean_document(pdf_dir, output_file)
                 print(f"    - 生成 {stats.get('total_chunks', 0)} 个chunks")
                 print(f"    - 输出: {output_file.name}")
                 print(f"    - 日志: {log_file.name}")
+                
+                # 二级聚合：生成sections
+                with open(output_file, 'r', encoding='utf-8') as f:
+                    chunks_data = json.load(f)
+                
+                sections = aggregator.aggregate_sections(chunks_data['chunks'])
+                
+                sections_data = {
+                    'doc_name': pdf_dir.name,
+                    'cleaned_at': datetime.now().isoformat(),
+                    'stats': {
+                        'total_sections': len(sections),
+                        'total_chunks': len(chunks_data['chunks']),
+                        'avg_chunks_per_section': len(chunks_data['chunks']) / len(sections) if sections else 0
+                    },
+                    'sections': sections
+                }
+                
+                with open(sections_file, 'w', encoding='utf-8') as f:
+                    json.dump(sections_data, f, ensure_ascii=False, indent=2)
+                
+                print(f"    - 生成 {len(sections)} 个sections")
+                print(f"    - 输出: {sections_file.name}")
+                
             except Exception as e:
                 print(f"    清洗失败: {e}")
                 import traceback
                 traceback.print_exc()
+    
+    def _index_cleaned_data_to_es(self):
+        """将清洗后的数据索引到ES"""
+        if not self.task_dir:
+            print("  错误: 任务目录未设置")
+            return
+        
+        if self.no_es or self.es_client is None:
+            print("  跳过ES索引（--no-es 模式）")
+            return
+        
+        print("\n" + "="*60)
+        print("开始索引清洗后的数据到 Elasticsearch...")
+        print("="*60)
+        
+        # 查找所有PDF输出子目录
+        pdf_dirs = [d for d in self.task_dir.iterdir() if d.is_dir()]
+        
+        total_chunks = 0
+        total_sections = 0
+        
+        for pdf_dir in pdf_dirs:
+            chunks_file = pdf_dir / 'cleaned_chunks.json'
+            sections_file = pdf_dir / 'cleaned_basic_part.json'
+            
+            # 索引chunks
+            if chunks_file.exists():
+                print(f"\n索引 chunks: {pdf_dir.name}")
+                try:
+                    with open(chunks_file, 'r', encoding='utf-8') as f:
+                        chunks_data = json.load(f)
+                    
+                    result = self.es_client.bulk_index_chunks(
+                        chunks_data['doc_name'],
+                        chunks_data['chunks']
+                    )
+                    print(f"  ✓ Chunks - 成功: {result['success']}, 失败: {result['error']}")
+                    total_chunks += result['success']
+                except Exception as e:
+                    print(f"  ✗ Chunks 索引失败: {e}")
+            
+            # 索引sections
+            if sections_file.exists():
+                print(f"索引 sections: {pdf_dir.name}")
+                try:
+                    with open(sections_file, 'r', encoding='utf-8') as f:
+                        sections_data = json.load(f)
+                    
+                    result = self.es_client.bulk_index_sections(
+                        sections_data['doc_name'],
+                        sections_data['sections']
+                    )
+                    print(f"  ✓ Sections - 成功: {result['success']}, 失败: {result['error']}")
+                    total_sections += result['success']
+                except Exception as e:
+                    print(f"  ✗ Sections 索引失败: {e}")
+        
+        print("\n" + "="*60)
+        print("索引总结:")
+        print(f"  - 总 chunks: {total_chunks}")
+        print(f"  - 总 sections: {total_sections}")
+        print("="*60)
     
     def _validate_and_report(self):
         """验证索引并生成报告"""
@@ -515,14 +605,25 @@ class PDFProcessor:
             test_queries = ["机器人", "比赛规则", "通信协议"]
             for query in test_queries:
                 try:
-                    results = self.es_client.search_content(query, size=3)
-                    print(f"\n查询 '{query}' 返回 {len(results)} 个结果")
-                    if results:
-                        for i, result in enumerate(results[:2], 1):
-                            content_preview = result['content'][:50] + "..." if len(result['content']) > 50 else result['content']
-                            print(f"  {i}. [{result['path']}] {content_preview}")
+                    # 搜索chunks
+                    chunks_results = self.es_client.search_chunks(query, size=3)
+                    print(f"\n  查询 '{query}' (chunks):")
+                    for i, result in enumerate(chunks_results[:3], 1):
+                        content_preview = result['content'][:50].replace('\n', ' ')
+                        pages = result.get('source_pages', [])
+                        page_str = f"页{pages[0]}" if pages else "未知页"
+                        print(f"    {i}. [{result.get('doc_name', 'N/A')}] {page_str} - {content_preview}...")
+                    
+                    # 搜索sections
+                    sections_results = self.es_client.search_sections(query, size=3)
+                    print(f"\n  查询 '{query}' (sections):")
+                    for i, result in enumerate(sections_results[:3], 1):
+                        heading = result.get('heading', '无标题')[:50]
+                        page_range = result.get('page_range', {})
+                        page_str = f"页{page_range.get('first', '?')}-{page_range.get('last', '?')}"
+                        print(f"    {i}. [{result.get('doc_name', 'N/A')}] {page_str} - {heading}")
                 except Exception as e:
-                    print(f"测试查询时出错: {e}")
+                    print(f"  搜索 '{query}' 失败: {e}")
         else:
             print("\n已跳过 Elasticsearch 测试查询（--no-es 模式或未配置 ESClient）。")
         
@@ -595,7 +696,208 @@ def main():
     parser.add_argument('--no-es', action='store_true', help='Only run OCR and segmentation and save JSON; skip ES indexing')
     parser.add_argument('--clean', action='store_true', help='Enable text cleaning and aggregation after OCR')
     parser.add_argument('--clean-only', type=str, metavar='DIR', help='Run cleaning only on existing output directory (e.g., output/run_20251224_120521)')
+    parser.add_argument('--index-only', type=str, metavar='DIR', help='Index cleaned data from existing output directory to ES')
     args = parser.parse_args()
+
+    # 离线索引模式
+    if args.index_only:
+        index_only_dir = Path(args.index_only)
+        if not index_only_dir.exists():
+            print(f"错误: 目录不存在: {index_only_dir}")
+            sys.exit(1)
+        
+        print("=" * 60)
+        print("离线索引模式")
+        print("=" * 60)
+        
+        es_client = ESClient()
+        
+        # 初始化索引
+        print("\n初始化 Elasticsearch 索引...")
+        try:
+            es_client.create_index()
+        except Exception as e:
+            print(f"ES 连接失败: {e}")
+            print("请确保 Elasticsearch 已启动（docker/elasticsearch-ik）")
+            sys.exit(1)
+        
+        # 查找所有PDF输出子目录
+        pdf_dirs = [d for d in index_only_dir.iterdir() if d.is_dir()]
+        
+        if not pdf_dirs:
+            print(f"未找到PDF输出目录: {index_only_dir}")
+            sys.exit(1)
+        
+        print(f"\n找到 {len(pdf_dirs)} 个PDF输出目录")
+        
+        total_chunks = 0
+        total_sections = 0
+        
+        for pdf_dir in pdf_dirs:
+            chunks_file = pdf_dir / 'cleaned_chunks.json'
+            sections_file = pdf_dir / 'cleaned_basic_part.json'
+            
+            # 索引chunks
+            if chunks_file.exists():
+                print(f"\n索引 chunks: {pdf_dir.name}")
+                try:
+                    with open(chunks_file, 'r', encoding='utf-8') as f:
+                        chunks_data = json.load(f)
+                    
+                    result = es_client.bulk_index_chunks(
+                        chunks_data['doc_name'],
+                        chunks_data['chunks']
+                    )
+                    print(f"  ✓ Chunks - 成功: {result['success']}, 失败: {result['error']}")
+                    total_chunks += result['success']
+                except Exception as e:
+                    print(f"  ✗ Chunks 索引失败: {e}")
+            else:
+                print(f"\n跳过 {pdf_dir.name}: 未找到 cleaned_chunks.json")
+            
+            # 索引sections
+            if sections_file.exists():
+                print(f"索引 sections: {pdf_dir.name}")
+                try:
+                    with open(sections_file, 'r', encoding='utf-8') as f:
+                        sections_data = json.load(f)
+                    
+                    result = es_client.bulk_index_sections(
+                        sections_data['doc_name'],
+                        sections_data['sections']
+                    )
+                    print(f"  ✓ Sections - 成功: {result['success']}, 失败: {result['error']}")
+                    total_sections += result['success']
+                except Exception as e:
+                    print(f"  ✗ Sections 索引失败: {e}")
+            else:
+                print(f"跳过 sections: 未找到 cleaned_basic_part.json")
+        
+        print("\n" + "=" * 60)
+        print("索引总结:")
+        print(f"  - 总 chunks: {total_chunks}")
+        print(f"  - 总 sections: {total_sections}")
+        print("=" * 60)
+        
+        # 测试搜索
+        print("\n测试搜索功能...")
+        test_queries = ["机器人", "比赛规则"]
+        for query in test_queries:
+            try:
+                chunks_results = es_client.search_chunks(query, size=2)
+                print(f"\n查询 '{query}' (chunks): {len(chunks_results)} 个结果")
+                for i, result in enumerate(chunks_results, 1):
+                    content_preview = result['content'][:50].replace('\n', ' ')
+                    pages = result.get('source_pages', [])
+                    page_str = f"页{pages[0]}" if pages else "未知页"
+                    print(f"  {i}. [{result.get('doc_name', 'N/A')}] {page_str} - {content_preview}...")
+            except Exception as e:
+                print(f"搜索 '{query}' 失败: {e}")
+        
+        print("\n" + "=" * 60)
+        print("离线索引完成!")
+        print("=" * 60)
+        return
+
+    # 离线索引模式
+    if args.index_only:
+        index_only_dir = Path(args.index_only)
+        if not index_only_dir.exists():
+            print(f"错误: 目录不存在: {index_only_dir}")
+            sys.exit(1)
+        
+        print("=" * 60)
+        print("离线索引模式")
+        print("=" * 60)
+        
+        es_client = ESClient()
+        
+        # 初始化索引
+        print("\n初始化 Elasticsearch 索引...")
+        try:
+            es_client.create_index()
+        except Exception as e:
+            print(f"ES 连接失败: {e}")
+            print("请确保 Elasticsearch 已启动（docker/elasticsearch-ik）")
+            sys.exit(1)
+        
+        # 查找所有PDF输出子目录
+        pdf_dirs = [d for d in index_only_dir.iterdir() if d.is_dir()]
+        
+        if not pdf_dirs:
+            print(f"未找到PDF输出目录: {index_only_dir}")
+            sys.exit(1)
+        
+        print(f"\n找到 {len(pdf_dirs)} 个PDF输出目录")
+        
+        total_chunks = 0
+        total_sections = 0
+        
+        for pdf_dir in pdf_dirs:
+            chunks_file = pdf_dir / 'cleaned_chunks.json'
+            sections_file = pdf_dir / 'cleaned_basic_part.json'
+            
+            # 索引chunks
+            if chunks_file.exists():
+                print(f"\n索引 chunks: {pdf_dir.name}")
+                try:
+                    with open(chunks_file, 'r', encoding='utf-8') as f:
+                        chunks_data = json.load(f)
+                    
+                    result = es_client.bulk_index_chunks(
+                        chunks_data['doc_name'],
+                        chunks_data['chunks']
+                    )
+                    print(f"  ✓ Chunks - 成功: {result['success']}, 失败: {result['error']}")
+                    total_chunks += result['success']
+                except Exception as e:
+                    print(f"  ✗ Chunks 索引失败: {e}")
+            else:
+                print(f"\n跳过 {pdf_dir.name}: 未找到 cleaned_chunks.json")
+            
+            # 索引sections
+            if sections_file.exists():
+                print(f"索引 sections: {pdf_dir.name}")
+                try:
+                    with open(sections_file, 'r', encoding='utf-8') as f:
+                        sections_data = json.load(f)
+                    
+                    result = es_client.bulk_index_sections(
+                        sections_data['doc_name'],
+                        sections_data['sections']
+                    )
+                    print(f"  ✓ Sections - 成功: {result['success']}, 失败: {result['error']}")
+                    total_sections += result['success']
+                except Exception as e:
+                    print(f"  ✗ Sections 索引失败: {e}")
+            else:
+                print(f"跳过 sections: 未找到 cleaned_basic_part.json")
+        
+        print("\n" + "=" * 60)
+        print("索引总结:")
+        print(f"  - 总 chunks: {total_chunks}")
+        print(f"  - 总 sections: {total_sections}")
+        print("=" * 60)
+        
+        # 测试搜索
+        print("\n测试搜索功能...")
+        test_queries = ["机器人", "比赛规则"]
+        for query in test_queries:
+            try:
+                chunks_results = es_client.search_chunks(query, size=2)
+                print(f"\n查询 '{query}' (chunks): {len(chunks_results)} 个结果")
+                for i, result in enumerate(chunks_results, 1):
+                    content_preview = result['content'][:50].replace('\n', ' ')
+                    pages = result.get('source_pages', [])
+                    page_str = f"页{pages[0]}" if pages else "未知页"
+                    print(f"  {i}. [{result.get('doc_name', 'N/A')}] {page_str} - {content_preview}...")
+            except Exception as e:
+                print(f"搜索 '{query}' 失败: {e}")
+        
+        print("\n" + "=" * 60)
+        print("离线索引完成!")
+        print("=" * 60)
+        return
 
     # 离线清洗模式
     if args.clean_only:
